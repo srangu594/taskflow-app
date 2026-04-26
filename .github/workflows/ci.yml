@@ -1,0 +1,230 @@
+name: CI — Pull Request Quality Gate
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [develop]
+
+# Cancel in-progress run when new commit is pushed to same PR
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION:   "20"
+
+jobs:
+
+  # ── Backend: lint, security scan, unit tests
+  backend:
+    name: Backend Tests (Python ${{ env.PYTHON_VERSION }})
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB:       taskflow_test
+          POSTGRES_USER:     taskflow
+          POSTGRES_PASSWORD: testpass123
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt
+          pip install flake8 bandit safety pytest pytest-cov httpx
+
+      - name: Lint (flake8)
+        run: cd backend && flake8 app/ --max-line-length=120 --statistics
+
+      - name: Security scan (bandit)
+        run: cd backend && bandit -r app/ -ll --quiet || true
+
+      - name: CVE scan (safety)
+        run: cd backend && safety check -r requirements.txt --short-report || true
+
+      - name: Unit tests + coverage
+        env:
+          # Tests use SQLite via test override — postgres service is available
+          # but tests are faster with in-memory SQLite
+          DATABASE_URL: postgresql://taskflow:testpass123@localhost:5432/taskflow_test
+        run: |
+          cd backend
+          pytest tests/ \
+            -v \
+            --tb=short \
+            --cov=app \
+            --cov-report=xml:coverage.xml \
+            --junitxml=test-results.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ github.sha }}
+          path: backend/test-results.xml
+          retention-days: 7
+
+  # ── Frontend: install, build
+  frontend:
+    name: Frontend Build (Node ${{ env.NODE_VERSION }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: cd frontend && npm ci
+
+      - name: Build React app
+        env:
+          REACT_APP_API_URL: /api
+          CI: false
+        run: cd frontend && npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: react-build-${{ github.sha }}
+          path: frontend/build/
+          retention-days: 7
+
+  # ── Docker: build both images (no push in CI)
+  docker-check:
+    name: Docker Build Check
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context:    ./backend
+          file:       ./backend/Dockerfile
+          push:       false
+          tags:       taskflow-backend:pr-check
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Build frontend (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context:    ./frontend
+          file:       ./frontend/Dockerfile
+          push:       false
+          build-args: REACT_APP_API_URL=/api
+          tags:       taskflow-frontend:pr-check
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+  # ── Terraform: validate and format check
+  terraform:
+    name: Terraform Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.0"
+
+      - name: Init (no backend — validation only)
+        run: cd terraform && terraform init -backend=false
+
+      - name: Validate
+        run: cd terraform && terraform validate
+
+      - name: Format check
+        run: cd terraform && terraform fmt -check -recursive
+
+  # ── K8s: validate all YAML files
+  k8s-validate:
+    name: Kubernetes YAML Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate YAML syntax
+        run: |
+          pip install pyyaml
+          python3 -c "
+          import yaml, os, sys
+          errors = []
+          for root, dirs, files in os.walk('k8s/'):
+              for f in files:
+                  if f.endswith(('.yaml', '.yml')):
+                      path = os.path.join(root, f)
+                      try:
+                          list(yaml.safe_load_all(open(path)))
+                          print(f'  OK  {path}')
+                      except yaml.YAMLError as e:
+                          errors.append(str(e))
+                          print(f'  FAIL  {path}: {e}')
+          if errors:
+              sys.exit(1)
+          print(f'All YAML valid')
+          "
+
+  # ── Summary comment on PR
+  pr-summary:
+    name: PR Summary
+    runs-on: ubuntu-latest
+    needs: [backend, frontend, docker-check, terraform, k8s-validate]
+    if: github.event_name == 'pull_request' && always()
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const results = {
+              'Backend Tests':  '${{ needs.backend.result }}',
+              'Frontend Build': '${{ needs.frontend.result }}',
+              'Docker Build':   '${{ needs.docker-check.result }}',
+              'Terraform':      '${{ needs.terraform.result }}',
+              'K8s Manifests':  '${{ needs.k8s-validate.result }}',
+            };
+            const icon = r => r === 'success' ? '✅' : r === 'skipped' ? '⏭️' : '❌';
+            const rows = Object.entries(results).map(([n,r]) => `| ${n} | ${icon(r)} ${r} |`).join('\n');
+            const allPassed = Object.values(results).every(r => ['success','skipped'].includes(r));
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              body: `## CI Quality Gate — ${allPassed ? '✅ All Checks Passed' : '❌ Some Checks Failed'}
+
+| Check | Status |
+|-------|--------|
+${rows}
+
+${allPassed
+  ? '**Ready to merge.** Jenkins will run the full 9-stage pipeline on merge to main.'
+  : '**Fix failing checks before merging.**'}
+`
+            });

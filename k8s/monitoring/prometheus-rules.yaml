@@ -1,0 +1,122 @@
+# ServiceMonitor: tells Prometheus to scrape taskflow backend pods
+# The label "release: kube-prometheus-stack" MUST match the Helm release name
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: taskflow-backend
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames:
+      - taskflow
+  selector:
+    matchLabels:
+      app: taskflow-backend
+  endpoints:
+    - port:         http
+      path:         /api/health
+      interval:     30s
+      scrapeTimeout: 10s
+---
+# PrometheusRule: alert definitions
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: taskflow-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+
+    - name: taskflow.availability
+      interval: 30s
+      rules:
+
+        - alert: TaskflowBackendDown
+          expr: |
+            kube_deployment_status_replicas_ready{
+              namespace="taskflow",
+              deployment="taskflow-backend"
+            } == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary:     "TaskFlow backend has zero ready replicas"
+            description: "No ready pods for taskflow-backend for 2+ minutes."
+            runbook:     "kubectl get pods -n taskflow && kubectl logs -n taskflow deploy/taskflow-backend"
+
+        - alert: TaskflowBackendDegraded
+          expr: |
+            kube_deployment_status_replicas_ready{namespace="taskflow",deployment="taskflow-backend"}
+            < kube_deployment_spec_replicas{namespace="taskflow",deployment="taskflow-backend"}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary:     "TaskFlow backend has fewer replicas than desired"
+            description: "Some pods are not ready in taskflow namespace."
+
+    - name: taskflow.pods
+      interval: 30s
+      rules:
+
+        - alert: TaskflowPodCrashLooping
+          expr: |
+            rate(kube_pod_container_status_restarts_total{namespace="taskflow"}[15m]) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary:     "Pod {{ $labels.pod }} is crash-looping"
+            description: "Pod restarted multiple times in 15 minutes. Check: kubectl logs {{ $labels.pod }} -n taskflow --previous"
+
+        - alert: TaskflowPodOOMKilled
+          expr: |
+            kube_pod_container_status_last_terminated_reason{namespace="taskflow",reason="OOMKilled"} == 1
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary:     "Pod {{ $labels.pod }} was OOMKilled"
+            description: "Container exceeded memory limit. Increase limits or fix a memory leak."
+
+    - name: taskflow.resources
+      interval: 60s
+      rules:
+
+        - alert: TaskflowHighCPU
+          expr: |
+            sum(rate(container_cpu_usage_seconds_total{namespace="taskflow",container!=""}[5m])) by (pod) > 0.4
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary:     "Pod {{ $labels.pod }} CPU > 40%"
+            description: "Pod using {{ $value | humanizePercentage }} CPU for 10+ minutes."
+
+        - alert: TaskflowHighMemory
+          expr: |
+            sum(container_memory_working_set_bytes{namespace="taskflow",container!=""}) by (pod) / 1024 / 1024 > 450
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary:     "Pod {{ $labels.pod }} memory > 450 MB"
+            description: "Pod using {{ $value }}MB (limit=512MB). Will OOMKill soon."
+
+    - name: taskflow.nodes
+      interval: 60s
+      rules:
+
+        - alert: SpotNodeDraining
+          expr: kube_node_spec_unschedulable == 1
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary:     "Node {{ $labels.node }} is unschedulable (Spot interruption)"
+            description: "Pods will reschedule automatically within 2 minutes."

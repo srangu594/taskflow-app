@@ -1,0 +1,208 @@
+name: CD — Deploy on Push to Main
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never cancel a deploy in progress — it leaves environment in unknown state
+concurrency:
+  group: cd-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION:    us-east-1
+  EKS_CLUSTER:   taskflow-prod
+  K8S_NAMESPACE: taskflow
+
+jobs:
+
+  # ── Build + push images + deploy frontend to S3
+  build-and-push:
+    name: Build, Push & Deploy Frontend
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag:   ${{ steps.meta.outputs.tag }}
+      ecr-backend: ${{ steps.urls.outputs.backend }}
+      ecr-frontend: ${{ steps.urls.outputs.frontend }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag (first 8 chars of SHA)
+        id: meta
+        run: |
+          echo "tag=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+
+      - name: Set ECR URLs
+        id: urls
+        run: |
+          BACKEND="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/taskflow-backend"
+          FRONTEND="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/taskflow-frontend"
+          echo "backend=${BACKEND}"   >> $GITHUB_OUTPUT
+          echo "frontend=${FRONTEND}" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build + push backend
+        uses: docker/build-push-action@v5
+        with:
+          context:    ./backend
+          file:       ./backend/Dockerfile
+          push:       true
+          tags: |
+            ${{ steps.urls.outputs.backend }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.urls.outputs.backend }}:latest
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Build + push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context:    ./frontend
+          file:       ./frontend/Dockerfile
+          push:       true
+          build-args: REACT_APP_API_URL=/api
+          tags: |
+            ${{ steps.urls.outputs.frontend }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.urls.outputs.frontend }}:latest
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Extract frontend build + deploy to S3
+        run: |
+          # Extract built files from the frontend Docker image
+          docker create --name fe-extract \
+            ${{ steps.urls.outputs.frontend }}:${{ steps.meta.outputs.tag }}
+          docker cp fe-extract:/usr/share/nginx/html ./react-build
+          docker rm fe-extract
+
+          # Static assets: long cache (React hashes filenames on every build)
+          aws s3 sync ./react-build s3://${{ secrets.S3_FRONTEND_BUCKET }}/ \
+            --delete \
+            --cache-control "public,max-age=31536000,immutable" \
+            --exclude "index.html" \
+            --exclude "*.json"
+
+          # index.html + manifests: no cache (so new deploys take effect immediately)
+          aws s3 cp ./react-build/index.html \
+            s3://${{ secrets.S3_FRONTEND_BUCKET }}/index.html \
+            --cache-control "no-cache,no-store,must-revalidate"
+
+          # Invalidate CloudFront so users get the new version right away
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+
+          rm -rf ./react-build
+          echo "Frontend deployed to S3 + CloudFront invalidation created"
+
+  # ── Deploy backend to EKS via GitOps
+  deploy-backend:
+    name: Deploy Backend to EKS
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need write access to commit manifest update
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --name   ${{ env.EKS_CLUSTER }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Update K8s manifest (GitOps trigger)
+        run: |
+          IMAGE_TAG="${{ needs.build-and-push.outputs.image-tag }}"
+
+          # Update image tag — ArgoCD detects this commit and deploys
+          sed -i "s|taskflow-backend:.*|taskflow-backend:${IMAGE_TAG}|g" \
+            k8s/base/deployment-backend.yaml
+
+          git config user.email "github-actions@taskflow.io"
+          git config user.name  "GitHub Actions CD"
+          git add k8s/base/deployment-backend.yaml
+
+          if git diff --staged --quiet; then
+            echo "No manifest change — same tag already deployed"
+          else
+            git commit -m "cd: deploy ${IMAGE_TAG} [skip ci]"
+            git push
+            echo "Manifest pushed — ArgoCD will sync within 3 minutes"
+          fi
+
+      - name: Apply K8s manifests + update secret
+        run: |
+          # Apply all base manifests (namespace, configmap, service, ingress etc.)
+          kubectl apply -f k8s/base/ --namespace=${{ env.K8S_NAMESPACE }} 2>&1 \
+            | grep -v "unchanged" || true
+
+          # Update DB secret with real connection string
+          kubectl create secret generic taskflow-secrets \
+            --namespace=${{ env.K8S_NAMESPACE }} \
+            --from-literal=DATABASE_URL="${{ secrets.DATABASE_URL }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/taskflow-backend \
+            --namespace=${{ env.K8S_NAMESPACE }} \
+            --timeout=180s
+
+      - name: Smoke test
+        run: |
+          # Port-forward for smoke test
+          kubectl port-forward svc/taskflow-backend-svc \
+            9977:80 -n ${{ env.K8S_NAMESPACE }} &
+          sleep 8
+
+          FAIL=0
+          check() {
+            local name="$1" url="$2" expect="$3"
+            if curl -sf --max-time 10 "$url" | grep -q "$expect"; then
+              echo "  PASS  $name"
+            else
+              echo "  FAIL  $name"
+              FAIL=$((FAIL+1))
+            fi
+          }
+
+          BASE="http://localhost:9977"
+          check "Health"    "$BASE/api/health"       '"status"'
+          check "Liveness"  "$BASE/api/health/live"  "alive"
+          check "Readiness" "$BASE/api/health/ready" "ready"
+          check "Tasks"     "$BASE/api/tasks/"       "["
+          check "Stats"     "$BASE/api/tasks/stats"  '"total"'
+
+          kill %1 2>/dev/null || true
+
+          if [ "$FAIL" -gt "0" ]; then
+            echo "Smoke test FAILED — rolling back"
+            kubectl rollout undo deployment/taskflow-backend \
+              -n ${{ env.K8S_NAMESPACE }}
+            exit 1
+          fi
+          echo "All smoke tests passed"

@@ -1,0 +1,496 @@
+/*
+ ╔══════════════════════════════════════════════════════════════════════╗
+ ║  TASKFLOW — Jenkins CI/CD Pipeline                                   ║
+ ║  GitHub: srangu594/taskflow-app                                      ║
+ ║                                                                      ║
+ ║  Auth: Jenkins EC2 has an IAM instance profile (created by          ║
+ ║  Terraform). AWS CLI commands work without static credentials.       ║
+ ║  Only GitHub PAT and ArgoCD password are in Jenkins credentials.    ║
+ ║                                                                      ║
+ ║  Stages:                                                             ║
+ ║  1.  Checkout + metadata                                             ║
+ ║  2.  Parallel: lint + security + Dockerfile + Terraform validate     ║
+ ║  3.  Unit tests + coverage                                           ║
+ ║  4.  Parallel: build backend + frontend Docker images                ║
+ ║  5.  Push images to ECR                                              ║
+ ║  6.  Terraform plan (only when terraform/ files changed)             ║
+ ║  7.  Update K8s manifest image tag (GitOps — ArgoCD watches this)   ║
+ ║  8.  ArgoCD sync + wait for Kubernetes rollout                       ║
+ ║  9.  Smoke test (8 endpoints)                                        ║
+ ║                                                                      ║
+ ║  On failure: automatic rollback via kubectl rollout undo             ║
+ ╚══════════════════════════════════════════════════════════════════════╝
+*/
+
+pipeline {
+    agent any
+
+    environment {
+        // ── AWS (no credentials block needed — EC2 instance profile handles auth)
+        AWS_REGION     = "us-east-1"
+        AWS_ACCOUNT_ID = credentials('aws-account-id')    // secret text: your 12-digit account ID
+        ECR_BACKEND    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/taskflow-backend"
+        ECR_FRONTEND   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/taskflow-frontend"
+
+        // ── Kubernetes
+        EKS_CLUSTER  = "taskflow-prod"
+        K8S_NAMESPACE = "taskflow"
+
+        // ── Credentials stored in Jenkins credential store
+        GITHUB_TOKEN     = credentials('github-pat')          // for git push manifest
+        ARGOCD_PASSWORD  = credentials('argocd-admin-password') // added AFTER ArgoCD installed
+        DB_URL           = credentials('taskflow-db-url')      // added AFTER terraform apply
+
+        // ── Computed at runtime
+        IMAGE_TAG  = "${env.GIT_COMMIT?.take(8) ?: env.BUILD_NUMBER}"
+        TF_DIR     = "terraform"
+        K8S_DIR    = "k8s/base"
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 45, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()   // prevent parallel deploys to same environment
+    }
+
+    triggers {
+        githubPush()         // webhook from GitHub on push to main
+        pollSCM('H 2 * * *') // daily fallback poll at 2am (in case webhook misses)
+    }
+
+    stages {
+
+        // ════════════════════════════════════════════════════
+        // STAGE 1 — CHECKOUT
+        // ════════════════════════════════════════════════════
+        stage('Checkout') {
+            steps {
+                echo "\033[1;36m━━━ STAGE 1: Checkout ━━━\033[0m"
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                    env.GIT_BRANCH_NAME = sh(
+                        script: 'git rev-parse --abbrev-ref HEAD',
+                        returnStdout: true
+                    ).trim()
+                    env.GIT_COMMIT_MSG = sh(
+                        script: 'git log -1 --pretty=%B | head -1',
+                        returnStdout: true
+                    ).trim()
+                    env.IMAGE_TAG = env.GIT_COMMIT_SHORT
+                    echo "Branch:  ${env.GIT_BRANCH_NAME}"
+                    echo "Commit:  ${env.GIT_COMMIT_SHORT}"
+                    echo "Message: ${env.GIT_COMMIT_MSG}"
+                    echo "Tag:     ${ECR_BACKEND}:${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════
+        // STAGE 2 — PARALLEL QUALITY CHECKS
+        // ════════════════════════════════════════════════════
+        stage('Quality Checks') {
+            parallel {
+
+                stage('Python Lint') {
+                    steps {
+                        dir('backend') {
+                            sh '''
+                                pip install --quiet flake8 bandit safety
+                                echo "=== flake8 ==="
+                                flake8 app/ --max-line-length=120 --statistics || true
+                                echo "=== bandit (SAST) ==="
+                                bandit -r app/ -ll --quiet || true
+                                echo "=== safety (CVE check) ==="
+                                safety check -r requirements.txt --short-report || true
+                                echo "Lint complete"
+                            '''
+                        }
+                    }
+                }
+
+                stage('Dockerfile Lint') {
+                    steps {
+                        sh '''
+                            docker run --rm -i hadolint/hadolint \
+                                < backend/Dockerfile || true
+                            docker run --rm -i hadolint/hadolint \
+                                < frontend/Dockerfile || true
+                            echo "Dockerfile lint complete"
+                        '''
+                    }
+                }
+
+                stage('K8s YAML Validate') {
+                    steps {
+                        sh '''
+                            pip install --quiet pyyaml
+                            python3 -c "
+import yaml, os, sys
+errors = []
+for root, dirs, files in os.walk('k8s/'):
+    for f in files:
+        if f.endswith(('.yaml', '.yml')):
+            path = os.path.join(root, f)
+            try:
+                list(yaml.safe_load_all(open(path)))
+                print(f'  OK  {path}')
+            except yaml.YAMLError as e:
+                errors.append(f'  FAIL  {path}: {e}')
+                print(f'  FAIL  {path}: {e}')
+if errors:
+    sys.exit(1)
+print('All K8s YAML files valid')
+"
+                        '''
+                    }
+                }
+
+                stage('Terraform Validate') {
+                    steps {
+                        dir(TF_DIR) {
+                            sh '''
+                                terraform init -backend=false -input=false
+                                terraform validate
+                                terraform fmt -check -recursive || true
+                                echo "Terraform validate complete"
+                            '''
+                        }
+                    }
+                }
+
+            }
+        }
+
+        // ════════════════════════════════════════════════════
+        // STAGE 3 — UNIT TESTS + COVERAGE
+        // Uses SQLite in-memory — no PostgreSQL needed in CI
+        // ════════════════════════════════════════════════════
+        stage('Test') {
+            steps {
+                echo "\033[1;36m━━━ STAGE 3: Tests ━━━\033[0m"
+                dir('backend') {
+                    sh '''
+                        pip install --quiet -r requirements.txt pytest pytest-cov httpx
+                        pytest tests/ \
+                            -v \
+                            --tb=short \
+                            --cov=app \
+                            --cov-report=xml:coverage.xml \
+                            --cov-report=term-missing \
+                            --junitxml=test-results.xml
+                    '''
+                }
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true,
+                          testResults: 'backend/test-results.xml'
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════
+        // STAGE 4 — PARALLEL: BUILD DOCKER IMAGES
+        // Uses --cache-from to reuse ECR layers (faster builds)
+        // ════════════════════════════════════════════════════
+        stage('Build Images') {
+            parallel {
+
+                stage('Build Backend') {
+                    steps {
+                        dir('backend') {
+                            sh """
+                                # Pull previous image for layer caching
+                                docker pull ${ECR_BACKEND}:latest 2>/dev/null || true
+
+                                docker build \\
+                                    --cache-from ${ECR_BACKEND}:latest \\
+                                    --build-arg APP_VERSION=${IMAGE_TAG} \\
+                                    --label git.commit=${GIT_COMMIT_SHORT} \\
+                                    --label build.number=${BUILD_NUMBER} \\
+                                    -t ${ECR_BACKEND}:${IMAGE_TAG} \\
+                                    -t ${ECR_BACKEND}:latest \\
+                                    -f Dockerfile .
+
+                                echo "Backend built: ${ECR_BACKEND}:${IMAGE_TAG}"
+                            """
+                        }
+                    }
+                }
+
+                stage('Build Frontend') {
+                    steps {
+                        dir('frontend') {
+                            sh """
+                                docker pull ${ECR_FRONTEND}:latest 2>/dev/null || true
+
+                                docker build \\
+                                    --cache-from ${ECR_FRONTEND}:latest \\
+                                    --build-arg REACT_APP_API_URL=/api \\
+                                    --label git.commit=${GIT_COMMIT_SHORT} \\
+                                    -t ${ECR_FRONTEND}:${IMAGE_TAG} \\
+                                    -t ${ECR_FRONTEND}:latest \\
+                                    -f Dockerfile .
+
+                                echo "Frontend built: ${ECR_FRONTEND}:${IMAGE_TAG}"
+                            """
+                        }
+                    }
+                }
+
+            }
+        }
+
+        // ════════════════════════════════════════════════════
+        // STAGE 5 — PUSH TO ECR
+        // Instance profile handles ECR auth — no static keys
+        // ════════════════════════════════════════════════════
+        stage('Push to ECR') {
+            steps {
+                echo "\033[1;36m━━━ STAGE 5: Push to ECR ━━━\033[0m"
+                sh """
+                    aws ecr get-login-password --region ${AWS_REGION} | \\
+                        docker login \\
+                            --username AWS \\
+                            --password-stdin \\
+                            ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+
+                    docker push ${ECR_BACKEND}:${IMAGE_TAG}
+                    docker push ${ECR_BACKEND}:latest
+                    echo "Backend pushed"
+
+                    docker push ${ECR_FRONTEND}:${IMAGE_TAG}
+                    docker push ${ECR_FRONTEND}:latest
+                    echo "Frontend pushed"
+
+                    docker logout \\
+                        ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+                """
+            }
+        }
+
+        // ════════════════════════════════════════════════════
+        // STAGE 6 — TERRAFORM PLAN
+        // Runs only when terraform/ files changed.
+        // Plan only — apply is done manually via session.sh.
+        // ════════════════════════════════════════════════════
+        stage('Terraform Plan') {
+            when {
+                allOf {
+                    branch 'main'
+                    changeset "terraform/**"
+                }
+            }
+            steps {
+                echo "\033[1;36m━━━ STAGE 6: Terraform Plan ━━━\033[0m"
+                dir(TF_DIR) {
+                    sh '''
+                        terraform init -input=false -reconfigure
+                        terraform validate
+
+                        # Exit code 2 = changes detected (not an error)
+                        terraform plan \
+                            -input=false \
+                            -detailed-exitcode \
+                            -out=tfplan \
+                            2>&1 | tee terraform-plan.txt || true
+
+                        echo "Terraform plan complete — review output above"
+                        echo "To apply infra changes: ./scripts/session.sh"
+                    '''
+                    archiveArtifacts artifacts: 'terraform-plan.txt',
+                                     allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════
+        // STAGE 7 — UPDATE K8S MANIFESTS (GitOps trigger)
+        // Jenkins commits the new image tag to Git.
+        // ArgoCD detects the commit and syncs to Kubernetes.
+        // This is the GitOps pattern: Git is the source of truth.
+        // ════════════════════════════════════════════════════
+        stage('Update K8s Manifests') {
+            when { branch 'main' }
+            steps {
+                echo "\033[1;36m━━━ STAGE 7: Update K8s Manifests ━━━\033[0m"
+                sh """
+                    # Replace the image tag in the deployment manifest
+                    sed -i \\
+                        "s|taskflow-backend:.*|taskflow-backend:${IMAGE_TAG}|g" \\
+                        ${K8S_DIR}/deployment-backend.yaml
+
+                    git config user.email "jenkins@taskflow.io"
+                    git config user.name  "Jenkins CI"
+
+                    git add ${K8S_DIR}/deployment-backend.yaml
+
+                    # Only commit if the manifest actually changed
+                    if git diff --staged --quiet; then
+                        echo "No manifest change — same image tag already deployed"
+                    else
+                        git commit -m "ci: deploy ${IMAGE_TAG} [skip ci]
+
+Build:   #${BUILD_NUMBER}
+Branch:  ${GIT_BRANCH_NAME}
+Commit:  ${GIT_COMMIT_SHORT}
+Message: ${GIT_COMMIT_MSG}"
+
+                        git push \\
+                            https://${GITHUB_TOKEN}@github.com/srangu594/taskflow-app.git \\
+                            HEAD:main
+
+                        echo "Manifest committed — ArgoCD will sync within 3 minutes"
+                    fi
+                """
+            }
+        }
+
+        // ════════════════════════════════════════════════════
+        // STAGE 8 — ARGOCD SYNC + ROLLOUT VERIFICATION
+        // Triggers ArgoCD sync immediately (no waiting for polling).
+        // Then waits for Kubernetes rolling update to complete.
+        // ════════════════════════════════════════════════════
+        stage('ArgoCD Sync') {
+            when { branch 'main' }
+            steps {
+                echo "\033[1;36m━━━ STAGE 8: ArgoCD Sync + Rollout ━━━\033[0m"
+                sh """
+                    # Configure kubectl using instance profile (no static keys)
+                    aws eks update-kubeconfig \\
+                        --region ${AWS_REGION} \\
+                        --name   ${EKS_CLUSTER}
+
+                    # Port-forward ArgoCD server to trigger sync from pipeline
+                    kubectl port-forward svc/argocd-server \\
+                        -n argocd 8080:443 &
+                    PF_PID=\$!
+                    sleep 6
+
+                    # Login and trigger immediate sync (don't wait for 3-min poll)
+                    argocd login localhost:8080 \\
+                        --username admin \\
+                        --password ${ARGOCD_PASSWORD} \\
+                        --insecure 2>/dev/null || echo "ArgoCD login failed — will use kubectl"
+
+                    argocd app sync taskflow \\
+                        --prune \\
+                        --timeout 180 \\
+                        2>/dev/null || echo "ArgoCD sync command sent"
+
+                    kill \$PF_PID 2>/dev/null || true
+
+                    # Wait for Kubernetes rolling update to complete
+                    echo "Waiting for rollout..."
+                    kubectl rollout status deployment/taskflow-backend \\
+                        --namespace=${K8S_NAMESPACE} \\
+                        --timeout=180s
+
+                    # Verify pods are ready
+                    READY=\$(kubectl get deployment taskflow-backend \\
+                        -n ${K8S_NAMESPACE} \\
+                        -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
+                    echo "Ready replicas: \$READY"
+                    if [ "\$READY" -lt "1" ]; then
+                        echo "ERROR: No ready replicas after deployment!"
+                        exit 1
+                    fi
+                    echo "Deployment successful — \$READY pod(s) ready"
+                """
+            }
+        }
+
+        // ════════════════════════════════════════════════════
+        // STAGE 9 — SMOKE TEST
+        // Tests 8 API endpoints via kubectl port-forward.
+        // Fails the build if any check fails → triggers rollback.
+        // ════════════════════════════════════════════════════
+        stage('Smoke Test') {
+            when { branch 'main' }
+            steps {
+                echo "\033[1;36m━━━ STAGE 9: Smoke Test ━━━\033[0m"
+                sh """
+                    kubectl port-forward \\
+                        svc/taskflow-backend-svc \\
+                        9988:80 \\
+                        -n ${K8S_NAMESPACE} &
+                    PF_PID=\$!
+                    sleep 8
+
+                    BASE="http://localhost:9988"
+                    PASS=0; FAIL=0
+
+                    run_check() {
+                        local name="\$1" url="\$2" expect="\$3"
+                        local body
+                        body=\$(curl -sf --max-time 10 "\$url" 2>/dev/null || echo "CURL_FAILED")
+                        if echo "\$body" | grep -q "\$expect"; then
+                            echo "  \033[0;32mPASS\033[0m  \$name"
+                            PASS=\$((PASS+1))
+                        else
+                            echo "  \033[0;31mFAIL\033[0m  \$name"
+                            FAIL=\$((FAIL+1))
+                        fi
+                    }
+
+                    echo "Testing \$BASE ..."
+                    run_check "Root"         "\$BASE/"                  "TaskFlow API"
+                    run_check "Health"       "\$BASE/api/health"        '"status"'
+                    run_check "Liveness"     "\$BASE/api/health/live"   "alive"
+                    run_check "Readiness"    "\$BASE/api/health/ready"  "ready"
+                    run_check "List tasks"   "\$BASE/api/tasks/"        "["
+                    run_check "Task stats"   "\$BASE/api/tasks/stats"   '"total"'
+                    run_check "List users"   "\$BASE/api/users/"        "["
+                    run_check "API docs"     "\$BASE/api/docs"          "swagger"
+
+                    kill \$PF_PID 2>/dev/null || true
+
+                    echo "Results: \$PASS passed, \$FAIL failed"
+                    if [ "\$FAIL" -gt "0" ]; then
+                        echo "Smoke test FAILED"
+                        exit 1
+                    fi
+                    echo "All smoke tests passed"
+                """
+            }
+        }
+
+    }
+
+    post {
+        success {
+            echo "\033[1;32m✅ Pipeline SUCCESS — Build #${BUILD_NUMBER} deployed (${IMAGE_TAG})\033[0m"
+        }
+
+        failure {
+            echo "\033[1;31m❌ Pipeline FAILED — Rolling back deployment\033[0m"
+            sh """
+                aws eks update-kubeconfig \\
+                    --region ${AWS_REGION} \\
+                    --name   ${EKS_CLUSTER} 2>/dev/null || true
+
+                kubectl rollout undo deployment/taskflow-backend \\
+                    -n ${K8S_NAMESPACE} 2>/dev/null && \
+                    echo "Rollback complete" || \
+                    echo "No previous deployment to roll back to"
+            """
+        }
+
+        always {
+            // Clean up local Docker images to prevent disk full
+            sh """
+                docker rmi ${ECR_BACKEND}:${IMAGE_TAG} 2>/dev/null || true
+                docker rmi ${ECR_FRONTEND}:${IMAGE_TAG} 2>/dev/null || true
+                docker image prune -f 2>/dev/null || true
+                echo "Docker cleanup done"
+            """
+            cleanWs()
+        }
+    }
+}

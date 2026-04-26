@@ -1,0 +1,111 @@
+# kube-prometheus-stack Helm values — cost-optimised for personal project
+#
+# Apply with:
+#   helm install kube-prometheus-stack \
+#     prometheus-community/kube-prometheus-stack \
+#     -n monitoring --create-namespace \
+#     -f helm/monitoring/values.yaml
+
+grafana:
+  enabled:       true
+  adminPassword: "admin123"   # Change this after first login
+  replicas:      1
+
+  persistence:
+    enabled: true
+    size:    2Gi
+
+  # Route Grafana to On-Demand system node — not Spot
+  # (Grafana stores dashboards in persistent storage, must not be interrupted)
+  nodeSelector:
+    node-type: on-demand
+
+  tolerations:
+    - key:      "dedicated"
+      value:    "system"
+      operator: "Equal"
+      effect:   "NoSchedule"
+
+  resources:
+    requests: { cpu: "50m",  memory: "128Mi" }
+    limits:   { cpu: "200m", memory: "256Mi" }
+
+  # Auto-load dashboards from ConfigMaps with this label
+  sidecar:
+    dashboards:
+      enabled: true
+      label:   grafana_dashboard
+
+prometheus:
+  enabled: true
+
+  prometheusSpec:
+    # 3-day retention (personal project — saves storage cost)
+    # Enterprise: 30-90 days + Thanos for long-term
+    retention: 3d
+
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 5Gi
+
+    # Route to On-Demand system node
+    nodeSelector:
+      node-type: on-demand
+
+    tolerations:
+      - key:      "dedicated"
+        value:    "system"
+        operator: "Equal"
+        effect:   "NoSchedule"
+
+    resources:
+      requests: { cpu: "100m",  memory: "256Mi" }
+      limits:   { cpu: "500m",  memory: "512Mi" }
+
+    scrapeInterval:     30s
+    evaluationInterval: 30s
+
+    # Discover ServiceMonitors in all namespaces
+    serviceMonitorNamespaceSelector: {}
+    serviceMonitorSelector:          {}
+    ruleNamespaceSelector:           {}
+    ruleSelector:                    {}
+
+# AlertManager disabled — saves 2 pods (~150Mi RAM each)
+# Alerts are visible in Prometheus UI but no notifications sent.
+# For notifications: set up AWS Budget alert (done in Terraform)
+# or enable AlertManager and configure email/Slack routes.
+alertmanager:
+  enabled: false
+
+# Node exporter: lightweight, keep enabled (OS metrics)
+nodeExporter:
+  enabled: true
+  resources:
+    requests: { cpu: "10m",  memory: "32Mi" }
+    limits:   { cpu: "50m",  memory: "64Mi" }
+
+# kube-state-metrics: needed for pod/deployment alerts
+kubeStateMetrics:
+  enabled: true
+  resources:
+    requests: { cpu: "10m",  memory: "32Mi" }
+    limits:   { cpu: "50m",  memory: "64Mi" }
+
+prometheusOperator:
+  resources:
+    requests: { cpu: "50m",  memory: "64Mi" }
+    limits:   { cpu: "100m", memory: "128Mi" }
+
+  nodeSelector:
+    node-type: on-demand
+
+  tolerations:
+    - key:      "dedicated"
+      value:    "system"
+      operator: "Equal"
+      effect:   "NoSchedule"

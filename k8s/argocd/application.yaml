@@ -1,0 +1,50 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: taskflow
+  namespace: argocd
+  labels:
+    app:         taskflow
+    environment: production
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    repoURL:        https://github.com/srangu594/taskflow-app.git
+    targetRevision: main
+    path:           k8s/base
+
+  destination:
+    server:    https://kubernetes.default.svc
+    namespace: taskflow
+
+  syncPolicy:
+    automated:
+      prune:      true    # delete K8s resources removed from Git
+      selfHeal:   true    # revert manual kubectl changes automatically
+      allowEmpty: false   # never sync if it would delete everything
+
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - ApplyOutOfSyncOnly=true
+      - ServerSideApply=true
+
+    retry:
+      limit: 5
+      backoff:
+        duration:    5s
+        factor:      2
+        maxDuration: 3m
+
+  # Ignore HPA-managed replica count.
+  # Without this, ArgoCD fights HPA: ArgoCD resets replicas to 2,
+  # HPA scales to 4, ArgoCD resets again — infinite loop.
+  ignoreDifferences:
+    - group:    apps
+      kind:     Deployment
+      name:     taskflow-backend
+      jsonPointers:
+        - /spec/replicas

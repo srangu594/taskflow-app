@@ -1,0 +1,126 @@
+# ── ClusterIP Service — internal routing, ALB Ingress routes to this
+apiVersion: v1
+kind: Service
+metadata:
+  name: taskflow-backend-svc
+  namespace: taskflow
+  labels:
+    app: taskflow-backend
+spec:
+  selector:
+    app: taskflow-backend
+  ports:
+    - name:       http
+      port:       80
+      targetPort: 8000
+      protocol:   TCP
+  type: ClusterIP
+---
+# ── HPA — Horizontal Pod Autoscaler
+# Scales backend pods between 2 and 8 based on CPU/memory.
+# min=2 ensures HA (one pod per node, spread by anti-affinity).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: taskflow-backend-hpa
+  namespace: taskflow
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind:       Deployment
+    name:       taskflow-backend
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type:               Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type:               Utilization
+          averageUtilization: 80
+  # Scale-up: wait 60s, add max 2 pods per minute (prevents thrashing)
+  # Scale-down: wait 5 min, remove max 1 pod per 2 min (conservative)
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type:          Pods
+          value:         2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type:          Pods
+          value:         1
+          periodSeconds: 120
+---
+# ── PodDisruptionBudget
+# Guarantees at least 1 pod stays running during:
+#   - kubectl drain (node upgrades, cluster upgrades)
+#   - Spot node interruptions
+#   - Voluntary evictions
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: taskflow-backend-pdb
+  namespace: taskflow
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: taskflow-backend
+---
+# ── Secret — DB connection string
+# This is a PLACEHOLDER. The real value is injected by:
+#   - scripts/session.sh (reads from terraform.tfvars)
+#   - Jenkins pipeline (uses taskflow-db-url credential)
+#   - GitHub Actions CD (uses DATABASE_URL secret)
+# The placeholder below prevents kubectl apply from failing if secret
+# is applied before the pipeline runs. It will be overwritten.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: taskflow-secrets
+  namespace: taskflow
+type: Opaque
+stringData:
+  DATABASE_URL: "postgresql://taskflow:REPLACE_ME@REPLACE_RDS_ENDPOINT:5432/taskflow_db"
+---
+# ── Ingress — AWS Application Load Balancer
+# Managed by aws-load-balancer-controller (installed via Helm).
+# Routes external HTTPS traffic to taskflow-backend-svc on port 80.
+# Frontend (React) is served separately from S3 + CloudFront — not via this ingress.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: taskflow-ingress
+  namespace: taskflow
+  annotations:
+    kubernetes.io/ingress.class:                     "alb"
+    alb.ingress.kubernetes.io/scheme:                "internet-facing"
+    alb.ingress.kubernetes.io/target-type:           "ip"
+    alb.ingress.kubernetes.io/listen-ports:          '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect:          "443"
+    alb.ingress.kubernetes.io/healthcheck-path:      "/api/health/live"
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthy-threshold-count:      "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count:    "3"
+    alb.ingress.kubernetes.io/group.name:            "taskflow"
+    alb.ingress.kubernetes.io/load-balancer-attributes: "idle_timeout.timeout_seconds=60"
+spec:
+  rules:
+    - http:
+        paths:
+          - path:     /api
+            pathType: Prefix
+            backend:
+              service:
+                name: taskflow-backend-svc
+                port:
+                  number: 80

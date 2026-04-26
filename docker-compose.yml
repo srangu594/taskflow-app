@@ -1,0 +1,112 @@
+version: "3.9"
+
+# ── Networks — all containers communicate on this bridge network
+networks:
+  taskflow-net:
+    driver: bridge
+
+# ── Volumes — persistent data survives container restarts
+volumes:
+  postgres_data:
+  pgadmin_data:
+
+services:
+
+  # ══════════════════════════════════════════
+  # TIER 3 — PostgreSQL Database
+  # ══════════════════════════════════════════
+  postgres:
+    image: postgres:16-alpine
+    container_name: taskflow-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       taskflow_db
+      POSTGRES_USER:     taskflow
+      POSTGRES_PASSWORD: taskflow123
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"     # exposed for local DB tools (pgAdmin, DBeaver)
+    networks:
+      - taskflow-net
+    healthcheck:
+      test:         ["CMD-SHELL", "pg_isready -U taskflow -d taskflow_db"]
+      interval:     10s
+      timeout:      5s
+      retries:      5
+      start_period: 20s
+
+  # ══════════════════════════════════════════
+  # TIER 2 — FastAPI Backend
+  # ══════════════════════════════════════════
+  backend:
+    build:
+      context:    ./backend
+      dockerfile: Dockerfile
+    image: taskflow-backend:local
+    container_name: taskflow-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL:    postgresql://taskflow:taskflow123@postgres:5432/taskflow_db
+      ALLOWED_ORIGINS: "http://localhost,http://localhost:3000,http://localhost:80"
+      APP_ENV:         development
+    ports:
+      - "8000:8000"     # API accessible at http://localhost:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - taskflow-net
+    healthcheck:
+      test:         ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/live')"]
+      interval:     30s
+      timeout:      10s
+      retries:      3
+      start_period: 20s
+    # Hot-reload in dev: mount source code
+    # Remove this volume line when building the production image
+    volumes:
+      - ./backend:/app
+
+  # ══════════════════════════════════════════
+  # TIER 1 — React Frontend (Nginx)
+  # ══════════════════════════════════════════
+  frontend:
+    build:
+      context:    ./frontend
+      dockerfile: Dockerfile
+      args:
+        REACT_APP_API_URL: /api
+    image: taskflow-frontend:local
+    container_name: taskflow-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"         # App accessible at http://localhost
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - taskflow-net
+
+  # ══════════════════════════════════════════
+  # OPTIONAL — PgAdmin (DB GUI)
+  # Launch with: docker-compose --profile debug up -d
+  # ══════════════════════════════════════════
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: taskflow-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL:    admin@taskflow.local
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - taskflow-net
+    depends_on:
+      - postgres
+    profiles:
+      - debug

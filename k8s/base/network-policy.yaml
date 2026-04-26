@@ -1,0 +1,74 @@
+# ── Default: deny all ingress in taskflow namespace
+# Explicit rules below whitelist what is needed
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: taskflow
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# ── Allow ALB → backend pods (port 8000)
+# ALB uses VPC IPs so we cannot restrict by pod selector — allow from anywhere
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-alb-to-backend
+  namespace: taskflow
+spec:
+  podSelector:
+    matchLabels:
+      app: taskflow-backend
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port:     8000
+      from: []
+---
+# ── Allow Prometheus (monitoring namespace) → backend pods
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: taskflow
+spec:
+  podSelector:
+    matchLabels:
+      app: taskflow-backend
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port:     8000
+---
+# ── Allow backend egress: RDS (5432), AWS APIs (443), DNS (53)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-backend-egress
+  namespace: taskflow
+spec:
+  podSelector:
+    matchLabels:
+      app: taskflow-backend
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: TCP
+          port:     5432    # PostgreSQL (RDS)
+    - ports:
+        - protocol: TCP
+          port:     443     # AWS APIs (ECR, Secrets Manager)
+    - ports:
+        - protocol: UDP
+          port:     53      # DNS resolution

@@ -1,0 +1,151 @@
+# IMPORTANT: Before applying, replace <AWS_ACCOUNT_ID> with your real account ID.
+# Command: sed -i "s/<AWS_ACCOUNT_ID>/123456789012/g" k8s/base/deployment-backend.yaml
+#
+# Jenkins pipeline updates the image tag automatically via sed on every deploy.
+# ArgoCD detects the Git commit and syncs the change to Kubernetes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taskflow-backend
+  namespace: taskflow
+  labels:
+    app:     taskflow-backend
+    tier:    backend
+    version: "1.0.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: taskflow-backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge:       1
+      maxUnavailable: 0   # zero-downtime: old pods stay until new ones are ready
+  template:
+    metadata:
+      labels:
+        app:  taskflow-backend
+        tier: backend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "8000"
+        prometheus.io/path:   "/api/health"
+    spec:
+      terminationGracePeriodSeconds: 30
+
+      # ── Node scheduling
+      # Prefer Spot app nodes. Falls back to On-Demand system node if Spot unavailable.
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key:      node-type
+                    operator: In
+                    values:   ["spot"]
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key:      kubernetes.io/os
+                    operator: In
+                    values:   ["linux"]
+        podAntiAffinity:
+          # Spread pods across nodes — never put 2 pods on the same node
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key:      app
+                    operator: In
+                    values:   ["taskflow-backend"]
+              topologyKey: kubernetes.io/hostname
+
+      # Allow fallback to On-Demand system node if Spot nodes are full
+      tolerations:
+        - key:      "dedicated"
+          operator: "Equal"
+          value:    "system"
+          effect:   "NoSchedule"
+
+      containers:
+        - name: backend
+          # Jenkins updates this tag on every deploy
+          # imagePullPolicy: Always ensures the latest tag is always pulled
+          # (never uses a cached image — critical for CI/CD correctness)
+          image:           <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/taskflow-backend:latest
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 8000
+              name:          http
+              protocol:      TCP
+
+          envFrom:
+            - configMapRef:
+                name: taskflow-config
+
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: taskflow-secrets
+                  key:  DATABASE_URL
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+          resources:
+            requests:
+              cpu:    "150m"
+              memory: "256Mi"
+            limits:
+              cpu:    "500m"
+              memory: "512Mi"
+
+          # Startup probe: gives slow-starting app time before liveness kicks in
+          # 12 retries × 5s = 60s maximum startup time
+          startupProbe:
+            httpGet:
+              path: /api/health/live
+              port: 8000
+            failureThreshold: 12
+            periodSeconds:    5
+
+          # Liveness probe: restarts pod if app is deadlocked
+          livenessProbe:
+            httpGet:
+              path: /api/health/live
+              port: 8000
+            initialDelaySeconds: 0    # startup probe handles the initial wait
+            periodSeconds:       20
+            failureThreshold:    3
+            timeoutSeconds:      5
+
+          # Readiness probe: removes pod from Service LB until DB is reachable
+          readinessProbe:
+            httpGet:
+              path: /api/health/ready
+              port: 8000
+            initialDelaySeconds: 0
+            periodSeconds:       10
+            failureThreshold:    3
+            timeoutSeconds:      5
+
+          # Graceful shutdown: give LB 5s to drain in-flight connections
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem:   false
+            runAsNonRoot:             true
+            runAsUser:                1000
+            capabilities:
+              drop: ["ALL"]
+
+      securityContext:
+        fsGroup: 1000

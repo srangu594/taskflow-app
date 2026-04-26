@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+coverage.xml
+test-results.xml
+htmlcov/
+test.db
+.venv/
+venv/
+
+# Node / React
+node_modules/
+frontend/build/
+
+# Terraform — NEVER commit these
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/*.tfplan
+terraform/terraform.tfvars       # ← CONTAINS YOUR DB PASSWORD
+terraform/.terraform.lock.hcl
+
+# Environment files
+.env
+.env.*
+*.env
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# SSH keys
+*.pem
+*.key
+taskflow-key.pem
+
+# AWS / Secrets
+kubeconfig
+tf-outputs.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
