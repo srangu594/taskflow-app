@@ -9,7 +9,7 @@ terraform {
   # Remote state — create S3 bucket and DynamoDB table BEFORE running terraform apply
   # See Step 1 in the deployment guide for the exact commands.
   backend "s3" {
-    bucket         = "taskflow-terraform-state-prod"
+    bucket         = "taskflow-terraform-state-932212590051"
     key            = "prod/terraform.tfstate"
     region         = "us-east-1"
     encrypt        = true
