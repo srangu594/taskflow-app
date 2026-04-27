@@ -11,5 +11,5 @@ key_pair_name      = "taskflow-key"
 
 # ── REPLACE THESE
 db_username = "taskflow"
-db_password = "YourSecurePassword123!"
-alert_email = "your@email.com"
+db_password = "Sandeeprangu1122"
+alert_email = "srangu594@gmail.com"

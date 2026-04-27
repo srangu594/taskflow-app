@@ -13,7 +13,7 @@ terraform {
     key            = "prod/terraform.tfstate"
     region         = "us-east-1"
     encrypt        = true
-    dynamodb_table = "taskflow-tf-locks"
+    use_lockfile = true
   }
 }
 
@@ -113,24 +113,40 @@ resource "aws_ecr_repository" "frontend" {
 resource "aws_ecr_lifecycle_policy" "backend" {
   repository = aws_ecr_repository.backend.name
   policy = jsonencode({
-    rules = [{
-      rulePriority = 1
-      description  = "Keep last 20 images"
-      selection    = { tagStatus = "any"; countType = "imageCountMoreThan"; countNumber = 20 }
-      action       = { type = "expire" }
-    }]
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Keep last 20 images"
+        selection = {
+          tagStatus   = "any"
+          countType   = "imageCountMoreThan"
+          countNumber = 20
+        }
+        action = {
+          type = "expire"
+        }
+      }
+    ]
   })
 }
 
 resource "aws_ecr_lifecycle_policy" "frontend" {
   repository = aws_ecr_repository.frontend.name
   policy = jsonencode({
-    rules = [{
-      rulePriority = 1
-      description  = "Keep last 20 images"
-      selection    = { tagStatus = "any"; countType = "imageCountMoreThan"; countNumber = 20 }
-      action       = { type = "expire" }
-    }]
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Keep last 20 images"
+        selection = {
+          tagStatus   = "any"
+          countType   = "imageCountMoreThan"
+          countNumber = 20
+        }
+        action = {
+          type = "expire"
+        }
+      }
+    ]
   })
 }
 
@@ -142,7 +158,7 @@ resource "aws_ecr_lifecycle_policy" "frontend" {
 # ══════════════════════════════════════════════════════
 resource "aws_security_group" "jenkins" {
   name        = "${var.project_name}-jenkins-sg"
-  description = "Jenkins CI server — HTTP, SSH"
+  description = "Jenkins CI server - HTTP, SSH"
   vpc_id      = module.vpc.vpc_id
 
   # Jenkins UI — from anywhere (required for GitHub webhook delivery)
@@ -263,8 +279,8 @@ resource "aws_iam_role_policy" "jenkins_permissions" {
           "dynamodb:DeleteItem",
         ]
         Resource = [
-          "arn:aws:s3:::taskflow-terraform-state-prod",
-          "arn:aws:s3:::taskflow-terraform-state-prod/*",
+          "arn:aws:s3:::taskflow-terraform-state-932212590051",
+          "arn:aws:s3:::taskflow-terraform-state-932212590051/*",
           "arn:aws:dynamodb:${var.aws_region}:*:table/taskflow-tf-locks",
         ]
       },
@@ -379,5 +395,5 @@ output "jenkins_iam_instance_profile" {
 output "database_url" {
   description = "Full DATABASE_URL for K8s secret (replace db_password placeholder)"
   value       = "postgresql://${var.db_username}:YOURPASSWORD@${module.rds.endpoint}/taskflow_db"
-  sensitive   = false
+  sensitive   = true
 }
