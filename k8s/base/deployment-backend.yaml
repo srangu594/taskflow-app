@@ -1,5 +1,5 @@
-# IMPORTANT: Before applying, replace <AWS_ACCOUNT_ID> with your real account ID.
-# Command: sed -i "s/<AWS_ACCOUNT_ID>/123456789012/g" k8s/base/deployment-backend.yaml
+# IMPORTANT: Before applying, replace 932212590051 with your real account ID.
+# Command: sed -i "s/932212590051/123456789012/g" k8s/base/deployment-backend.yaml
 #
 # Jenkins pipeline updates the image tag automatically via sed on every deploy.
 # ArgoCD detects the Git commit and syncs the change to Kubernetes.
@@ -73,7 +73,7 @@ spec:
           # Jenkins updates this tag on every deploy
           # imagePullPolicy: Always ensures the latest tag is always pulled
           # (never uses a cached image — critical for CI/CD correctness)
-          image:           <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/taskflow-backend:latest
+          image:           932212590051.dkr.ecr.us-east-1.amazonaws.com/taskflow-backend:latest
           imagePullPolicy: Always
 
           ports:
