@@ -435,9 +435,9 @@ Message: ${GIT_COMMIT_MSG}"
                     run_check "Health"       "\$BASE/api/health"        '"status"'
                     run_check "Liveness"     "\$BASE/api/health/live"   "alive"
                     run_check "Readiness"    "\$BASE/api/health/ready"  "ready"
-                    run_check "List tasks"   "\$BASE/api/tasks/"        "["
+                    run_check "List tasks"   "\$BASE/api/tasks/"        "title"
                     run_check "Task stats"   "\$BASE/api/tasks/stats"   '"total"'
-                    run_check "List users"   "\$BASE/api/users/"        "["
+                    run_check "List users"   "\$BASE/api/users/"        "sandy"
                     run_check "API docs"     "\$BASE/api/docs"          "swagger"
 
                     kill \$PF_PID 2>/dev/null || true
