@@ -283,11 +283,9 @@ print('All K8s YAML files valid')
         // ════════════════════════════════════════════════════
         stage('Terraform Plan') {
             when {
-                allOf {
-                    branch 'main'
-                    changeset "terraform/**"
-                }
+                changeset "terraform/**"
             }
+
             steps {
                 echo "\033[1;36m━━━ STAGE 6: Terraform Plan ━━━\033[0m"
                 dir(TF_DIR) {
@@ -318,7 +316,6 @@ print('All K8s YAML files valid')
         // This is the GitOps pattern: Git is the source of truth.
         // ════════════════════════════════════════════════════
         stage('Update K8s Manifests') {
-            when { branch 'main' }
             steps {
                 echo "\033[1;36m━━━ STAGE 7: Update K8s Manifests ━━━\033[0m"
                 sh """
@@ -359,7 +356,6 @@ Message: ${GIT_COMMIT_MSG}"
         // Then waits for Kubernetes rolling update to complete.
         // ════════════════════════════════════════════════════
         stage('ArgoCD Sync') {
-            when { branch 'main' }
             steps {
                 echo "\033[1;36m━━━ STAGE 8: ArgoCD Sync + Rollout ━━━\033[0m"
                 sh """
@@ -413,7 +409,6 @@ Message: ${GIT_COMMIT_MSG}"
         // Fails the build if any check fails → triggers rollback.
         // ════════════════════════════════════════════════════
         stage('Smoke Test') {
-            when { branch 'main' }
             steps {
                 echo "\033[1;36m━━━ STAGE 9: Smoke Test ━━━\033[0m"
                 sh """
