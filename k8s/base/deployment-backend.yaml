@@ -73,7 +73,7 @@ spec:
           # Jenkins updates this tag on every deploy
           # imagePullPolicy: Always ensures the latest tag is always pulled
           # (never uses a cached image — critical for CI/CD correctness)
-          image:           932212590051.dkr.ecr.us-east-1.amazonaws.com/taskflow-backend:latest
+          image:           932212590051.dkr.ecr.us-east-1.amazonaws.com/taskflow-backend:a33b91e6
           imagePullPolicy: Always
 
           ports:
