@@ -52,13 +52,16 @@ spec:
                     operator: In
                     values:   ["linux"]
         podAntiAffinity:
-          # Spread pods across nodes — never put 2 pods on the same node
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
+          # Prefer spreading pods across nodes but allow same node if needed
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
                 matchExpressions:
-                  - key:      app
-                    operator: In
-                    values:   ["taskflow-backend"]
+                - key: app
+                  operator: In
+                  values:
+                  - taskflow-backend
               topologyKey: kubernetes.io/hostname
 
       # Allow fallback to On-Demand system node if Spot nodes are full
