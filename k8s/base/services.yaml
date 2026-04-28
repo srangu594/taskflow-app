@@ -76,22 +76,7 @@ spec:
     matchLabels:
       app: taskflow-backend
 ---
-# ── Secret — DB connection string
-# This is a PLACEHOLDER. The real value is injected by:
-#   - scripts/session.sh (reads from terraform.tfvars)
-#   - Jenkins pipeline (uses taskflow-db-url credential)
-#   - GitHub Actions CD (uses DATABASE_URL secret)
-# The placeholder below prevents kubectl apply from failing if secret
-# is applied before the pipeline runs. It will be overwritten.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: taskflow-secrets
-  namespace: taskflow
-type: Opaque
-stringData:
-  DATABASE_URL: "postgresql://taskflow:REPLACE_ME@REPLACE_RDS_ENDPOINT:5432/taskflow_db"
----
+
 # ── Ingress — AWS Application Load Balancer
 # Managed by aws-load-balancer-controller (installed via Helm).
 # Routes external HTTPS traffic to taskflow-backend-svc on port 80.
