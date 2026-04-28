@@ -101,12 +101,15 @@ class TestUsers:
 class TestTasks:
     @pytest.fixture
     def user_id(self, client):
+        import uuid
+        unique = str(uuid.uuid4())[:8]
         r = client.post("/api/users/", json={
-            "email": "taskowner@taskflow.io",
-            "username": "taskowner",
+            "email": f"taskowner_{unique}@taskflow.io",
+            "username": f"taskowner_{unique}",
             "full_name": "Task Owner",
             "password": "pw123",
         })
+        assert r.status_code == 201, f"User creation failed: {r.json()}"
         return r.json()["id"]
 
     def test_create_task(self, client, user_id):

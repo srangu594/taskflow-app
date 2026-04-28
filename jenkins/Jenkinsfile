@@ -178,6 +178,7 @@ print('All K8s YAML files valid')
                 dir('backend') {
                     sh '''
                         pip install --quiet -r requirements.txt pytest pytest-cov httpx
+                        rm -f test.db
                         DATABASE_URL="sqlite:///./test.db" pytest tests/ \
                             -v \
                             --tb=short \
