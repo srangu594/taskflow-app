@@ -27,6 +27,7 @@ pipeline {
 
     environment {
         // ── AWS (no credentials block needed — EC2 instance profile handles auth)
+        PATH = "/var/lib/jenkins/.local/bin:${env.PATH}"
         AWS_REGION     = "us-east-1"
         AWS_ACCOUNT_ID = credentials('aws-account-id')    // secret text: your 12-digit account ID
         ECR_BACKEND    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/taskflow-backend"
