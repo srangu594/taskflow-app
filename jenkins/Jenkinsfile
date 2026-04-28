@@ -207,11 +207,8 @@ print('All K8s YAML files valid')
                     steps {
                         dir('backend') {
                             sh """
-                                # Pull previous image for layer caching
-                                docker pull ${ECR_BACKEND}:latest 2>/dev/null || true
 
                                 docker build \\
-                                    --cache-from ${ECR_BACKEND}:latest \\
                                     --build-arg APP_VERSION=${IMAGE_TAG} \\
                                     --label git.commit=${GIT_COMMIT_SHORT} \\
                                     --label build.number=${BUILD_NUMBER} \\
@@ -229,10 +226,8 @@ print('All K8s YAML files valid')
                     steps {
                         dir('frontend') {
                             sh """
-                                docker pull ${ECR_FRONTEND}:latest 2>/dev/null || true
-
+                            
                                 docker build \\
-                                    --cache-from ${ECR_FRONTEND}:latest \\
                                     --build-arg REACT_APP_API_URL=/api \\
                                     --label git.commit=${GIT_COMMIT_SHORT} \\
                                     -t ${ECR_FRONTEND}:${IMAGE_TAG} \\
