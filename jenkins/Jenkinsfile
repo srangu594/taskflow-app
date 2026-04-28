@@ -178,7 +178,7 @@ print('All K8s YAML files valid')
                 dir('backend') {
                     sh '''
                         pip install --quiet -r requirements.txt pytest pytest-cov httpx
-                        pytest tests/ \
+                        DATABASE_URL="sqlite:///./test.db" pytest tests/ \
                             -v \
                             --tb=short \
                             --cov=app \
@@ -195,7 +195,6 @@ print('All K8s YAML files valid')
                 }
             }
         }
-
         // ════════════════════════════════════════════════════
         // STAGE 4 — PARALLEL: BUILD DOCKER IMAGES
         // Uses --cache-from to reuse ECR layers (faster builds)
